@@ -72,11 +72,21 @@ function num(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function formatBeijing(ms) {
+  const d = new Date(ms + 8 * 3600 * 1000); // 手动 +8 小时，再用 UTC getter 读
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mi = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+}
+
 function tsFromSec(sec) {
   if (!sec || !Number.isFinite(Number(sec))) {
-    return new Date().toISOString().slice(0, 16).replace("T", " ");
+    return formatBeijing(Date.now());
   }
-  return new Date(Number(sec) * 1000).toISOString().slice(0, 16).replace("T", " ");
+  return formatBeijing(Number(sec) * 1000);
 }
 
 /** 源 1：ulist.np 快照（最稳） */
