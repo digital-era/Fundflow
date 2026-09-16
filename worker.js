@@ -1,10 +1,18 @@
 /**
- * TradeAgent Worker — 仅代理东财资金流（带缓存/重试/备用源）
+ * TradeAgent Worker — 仅代理东财资金流（含净比 / 缓存 / 重试 / 备用源）
  *
  * GET  /health
  * GET  /fundflow?code=605058
  * GET  /fundflow/batch?codes=605058,603186
  * POST /fundflow/batch  body: { "codes": ["605058"] }
+ *
+ * 返回字段：
+ *   code, main_net, main_net_pct,
+ *   super_net, super_net_pct,
+ *   large_net, large_net_pct,
+ *   mid_net, mid_net_pct,
+ *   small_net, small_net_pct,
+ *   time, source
  */
 
 const CORS = {
@@ -51,12 +59,27 @@ async function fetchJson(url, retries = 2, baseDelay = 400) {
     } catch (e) {
       console.log("fetch error", e.message, url);
     }
-    if (i < retries) await new Promise((res) => setTimeout(res, baseDelay * (i + 1)));
+    if (i < retries) {
+      await new Promise((res) => setTimeout(res, baseDelay * (i + 1)));
+    }
   }
   return null;
 }
 
-/** 源 1：ulist.np 快照（最稳、支持批量，实际是一对一调用） */
+function num(v) {
+  if (v == null || v === "-" || v === "") return 0;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function tsFromSec(sec) {
+  if (!sec || !Number.isFinite(Number(sec))) {
+    return new Date().toISOString().slice(0, 16).replace("T", " ");
+  }
+  return new Date(Number(sec) * 1000).toISOString().slice(0, 16).replace("T", " ");
+}
+
+/** 源 1：ulist.np 快照（最稳） */
 async function tryUlist(code) {
   const sid = secid(code);
   const url = new URL("https://push2.eastmoney.com/api/qt/ulist.np/get");
@@ -64,7 +87,7 @@ async function tryUlist(code) {
   url.searchParams.set("secids", sid);
   url.searchParams.set(
     "fields",
-    "f12,f14,f62,f66,f72,f78,f84,f124"
+    "f12,f14,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f124"
   );
   url.searchParams.set("_", String(Date.now()));
 
@@ -75,30 +98,52 @@ async function tryUlist(code) {
     console.log("ulist empty", code, JSON.stringify(data).slice(0, 200));
     return null;
   }
-  const num = (v) => (v == null || v === "-" ? 0 : Number(v));
-  const t = row.f124
-    ? new Date(row.f124 * 1000).toISOString().slice(0, 16).replace("T", " ")
-    : new Date().toISOString().slice(0, 16).replace("T", " ");
   return {
     code: String(code).padStart(6, "0"),
     main_net: num(row.f62),
+    main_net_pct: num(row.f184),
     super_net: num(row.f66),
+    super_net_pct: num(row.f69),
     large_net: num(row.f72),
+    large_net_pct: num(row.f75),
     mid_net: num(row.f78),
+    mid_net_pct: num(row.f81),
     small_net: num(row.f84),
-    time: t,
+    small_net_pct: num(row.f87),
+    time: tsFromSec(row.f124),
     source: "eastmoney_ulist",
   };
 }
 
-/** 源 2：分钟级 kline（原逻辑） */
+function parseKline(p, code, source) {
+  return {
+    code: String(code).padStart(6, "0"),
+    main_net: num(p[1]),
+    small_net: num(p[2]),
+    mid_net: num(p[3]),
+    large_net: num(p[4]),
+    super_net: num(p[5]),
+    main_net_pct: num(p[6]),
+    small_net_pct: num(p[7]),
+    mid_net_pct: num(p[8]),
+    large_net_pct: num(p[9]),
+    super_net_pct: num(p[10]),
+    time: p[0],
+    source,
+  };
+}
+
+/** 源 2：分钟级 kline */
 async function tryMinute(code) {
   const sid = secid(code);
   const url = new URL("https://push2.eastmoney.com/api/qt/stock/fflow/kline/get");
   url.searchParams.set("secid", sid);
   url.searchParams.set("klt", "1");
   url.searchParams.set("fields1", "f1,f2,f3,f7");
-  url.searchParams.set("fields2", "f51,f52,f53,f54,f55,f56,f57");
+  url.searchParams.set(
+    "fields2",
+    "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+  );
   url.searchParams.set("lmt", "240");
   url.searchParams.set("_", String(Date.now()));
 
@@ -108,23 +153,19 @@ async function tryMinute(code) {
     console.log("minute empty", code, JSON.stringify(data).slice(0, 200));
     return null;
   }
-  const p = klines[klines.length - 1].split(",");
-  return {
-    code: String(code).padStart(6, "0"),
-    main_net: +p[1],
-    small_net: +p[2],
-    mid_net: +p[3],
-    large_net: +p[4],
-    super_net: +p[5],
-    time: p[0],
-    source: "eastmoney_minute",
-  };
+  return parseKline(
+    klines[klines.length - 1].split(","),
+    code,
+    "eastmoney_minute"
+  );
 }
 
-/** 源 3：日级 kline（最终兜底） */
+/** 源 3：日级 kline（兜底） */
 async function tryDaily(code) {
   const sid = secid(code);
-  const url = new URL("https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get");
+  const url = new URL(
+    "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+  );
   url.searchParams.set("secid", sid);
   url.searchParams.set("klt", "101");
   url.searchParams.set("fields1", "f1,f2,f3,f7");
@@ -137,21 +178,18 @@ async function tryDaily(code) {
 
   const data = await fetchJson(url.toString());
   const klines = data?.data?.klines || [];
-  if (!klines.length) return null;
-  const p = klines[klines.length - 1].split(",");
-  return {
-    code: String(code).padStart(6, "0"),
-    main_net: +p[1],
-    small_net: +p[2],
-    mid_net: +p[3],
-    large_net: +p[4],
-    super_net: +p[5],
-    time: p[0],
-    source: "eastmoney_daily",
-  };
+  if (!klines.length) {
+    console.log("daily empty", code, JSON.stringify(data).slice(0, 200));
+    return null;
+  }
+  return parseKline(
+    klines[klines.length - 1].split(","),
+    code,
+    "eastmoney_daily"
+  );
 }
 
-/** 带缓存的实际获取：命中缓存直接返回，未命中依次尝试三个源 */
+/** 带缓存：命中直接返回；未命中依次尝试三个源；成功才写缓存 */
 async function fetchEastmoneyFundFlow(code, ctx) {
   const key = String(code).padStart(6, "0");
   const cache = caches.default;
@@ -163,7 +201,7 @@ async function fetchEastmoneyFundFlow(code, ctx) {
   if (hit) {
     try {
       const obj = await hit.json();
-      if (obj && obj.main_net != null) {
+      if (obj && obj.main_net != null && obj.source) {
         return { ...obj, cached: true };
       }
     } catch {}
