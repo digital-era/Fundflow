@@ -21,15 +21,19 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// 缓存 TTL 必须大于 300s 监控间隔：保证每轮基本命中上一轮缓存，
-// 避免每轮都打东财导致被限流。
-const CACHE_TTL_SECONDS = 350;
+//380~440s	大部分轮命中，少量刷新	数据新鲜度≤ 7 分钟
+// 基础 TTL：>380s 监控间隔，保证下一次扫描能命中
+const CACHE_TTL_BASE = 380;
+// TTL 抖动上限（秒）：给每个代码加 0~200s 抖动，打散集中过期
+const CACHE_TTL_JITTER = 60;
 
-// 批量 ulist 分批参数：一次请求的 secids 不宜过多
-const ULIST_BATCH_SIZE = 15;
-const ULIST_BATCH_DELAY_MS = 250;
+// ulist 分批：更小批次、更长间隔，降低被东财静默丢弃的概率
+const ULIST_BATCH_SIZE = 10;
+const ULIST_BATCH_DELAY_MS = 400;
+// 全部失败时再做一次 ulist 重试前的等待
+const ULIST_RETRY_DELAY_MS = 600;
 
-// 降级逐只请求的并发与延迟：避免瞬间并发打满东财限额
+// 降级逐只请求：限制并发 + 加延迟
 const DEGRADE_CONCURRENCY = 3;
 const DEGRADE_DELAY_MS = 200;
 
@@ -85,7 +89,7 @@ function num(v) {
 }
 
 function formatBeijing(ms) {
-  const d = new Date(ms + 8 * 3600 * 1000); // 手动 +8 小时，再用 UTC getter 读
+  const d = new Date(ms + 8 * 3600 * 1000);
   const yyyy = d.getUTCFullYear();
   const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(d.getUTCDate()).padStart(2, "0");
@@ -118,6 +122,17 @@ function makeUlistRow(row) {
     time: tsFromSec(row.f124),
     source: "eastmoney_ulist",
   };
+}
+
+/** 基于代码派生抖动，让每只代码的过期时间不完全一致 */
+function cacheTTLFor(code) {
+  let h = 0;
+  const s = String(code);
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 31 + s.charCodeAt(i)) | 0;
+  }
+  const jitter = Math.abs(h) % CACHE_TTL_JITTER;
+  return CACHE_TTL_BASE + jitter;
 }
 
 /** 源 1：ulist.np 快照（单只，保留原逻辑） */
@@ -289,12 +304,13 @@ async function readCache(code) {
 
 async function writeCache(flow, ctx) {
   if (!flow || flow.main_net == null) return;
-  const { request } = cacheKeyOf(flow.code);
+  const { request, key } = cacheKeyOf(flow.code);
   const cache = caches.default;
+  const ttl = cacheTTLFor(key);
   const resp = new Response(JSON.stringify(flow), {
     headers: {
       "Content-Type": "application/json",
-      "Cache-Control": `max-age=${CACHE_TTL_SECONDS}`,
+      "Cache-Control": `max-age=${ttl}`,
     },
   });
   if (ctx && ctx.waitUntil) ctx.waitUntil(cache.put(request, resp.clone()));
@@ -324,7 +340,7 @@ async function fetchEastmoneyFundFlow(code, ctx) {
   return flow;
 }
 
-/** 简单并发控制：最多 concurrency 个 worker 同时执行 */
+/** 并发控制：最多 concurrency 个同时执行 */
 async function runWithConcurrency(items, concurrency, worker) {
   const queue = items.slice();
   const runners = Array.from(
@@ -339,12 +355,12 @@ async function runWithConcurrency(items, concurrency, worker) {
   await Promise.all(runners);
 }
 
-/** 批量：查缓存 → 分批 ulist → 逐只降级（限并发 + 延迟） */
+/** 批量：查缓存 → 分批 ulist → 失败再 ulist 重试 → 逐只降级（限并发 + 延迟） */
 async function fetchBatchFundFlow(codes, ctx) {
   const results = {};
   const missing = [];
 
-  // 1) 并发查缓存（Cache API 很快，不增加上游压力）
+  // 1) 并发查缓存
   await Promise.all(
     codes.map(async (c) => {
       const key = String(c).padStart(6, "0");
@@ -359,10 +375,9 @@ async function fetchBatchFundFlow(codes, ctx) {
 
   if (!missing.length) return results;
 
-  // 稳定 secids 顺序
   missing.sort();
 
-  // 2) 分批 ulist
+  // 2) 第一轮 ulist 批量
   let ulistMap = {};
   try {
     ulistMap = await tryUlistBatch(missing);
@@ -370,22 +385,43 @@ async function fetchBatchFundFlow(codes, ctx) {
     console.log("ulist batch fail", e.message);
   }
 
-  // 3) 批量结果落库
-  const stillMissing = [];
+  const stillMissing1 = [];
   for (const key of missing) {
     const flow = ulistMap[key];
     if (flow && flow.main_net != null) {
       results[key] = flow;
       await writeCache(flow, ctx);
     } else {
-      stillMissing.push(key);
+      stillMissing1.push(key);
     }
   }
 
-  if (!stillMissing.length) return results;
+  if (!stillMissing1.length) return results;
 
-  // 4) 仍缺失的逐只降级（限制并发 + 延迟）
-  await runWithConcurrency(stillMissing, DEGRADE_CONCURRENCY, async (key) => {
+  // 3) 第二轮 ulist 重试（对第一轮失败的代码再拉一次）
+  await sleep(ULIST_RETRY_DELAY_MS);
+  let retryMap = {};
+  try {
+    retryMap = await tryUlistBatch(stillMissing1);
+  } catch (e) {
+    console.log("ulist retry fail", e.message);
+  }
+
+  const stillMissing2 = [];
+  for (const key of stillMissing1) {
+    const flow = retryMap[key];
+    if (flow && flow.main_net != null) {
+      results[key] = flow;
+      await writeCache(flow, ctx);
+    } else {
+      stillMissing2.push(key);
+    }
+  }
+
+  if (!stillMissing2.length) return results;
+
+  // 4) 仍缺失的逐只降级到 minute/daily
+  await runWithConcurrency(stillMissing2, DEGRADE_CONCURRENCY, async (key) => {
     let flow = null;
     for (const fn of [tryMinute, tryDaily]) {
       try {
