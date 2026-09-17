@@ -21,8 +21,17 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// 缓存 TTL 与 300s 监控间隔匹配：每轮监控基本都命中上一轮缓存
-const CACHE_TTL_SECONDS = 280;
+// 缓存 TTL 必须大于 300s 监控间隔：保证每轮基本命中上一轮缓存，
+// 避免每轮都打东财导致被限流。
+const CACHE_TTL_SECONDS = 350;
+
+// 批量 ulist 分批参数：一次请求的 secids 不宜过多
+const ULIST_BATCH_SIZE = 15;
+const ULIST_BATCH_DELAY_MS = 250;
+
+// 降级逐只请求的并发与延迟：避免瞬间并发打满东财限额
+const DEGRADE_CONCURRENCY = 3;
+const DEGRADE_DELAY_MS = 200;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -43,6 +52,8 @@ const EM_HEADERS = {
   Accept: "*/*",
 };
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function fetchJson(url, retries = 2, baseDelay = 400) {
   for (let i = 0; i <= retries; i++) {
     try {
@@ -61,7 +72,7 @@ async function fetchJson(url, retries = 2, baseDelay = 400) {
       console.log("fetch error", e.message, url);
     }
     if (i < retries) {
-      await new Promise((res) => setTimeout(res, baseDelay * (i + 1)));
+      await sleep(baseDelay * (i + 1));
     }
   }
   return null;
@@ -131,41 +142,50 @@ async function tryUlist(code) {
   return makeUlistRow(row);
 }
 
-/** 源 1-批量：一次请求取多只，返回 { code: flow } */
+/** 源 1-批量：分批请求，返回 { code: flow } */
 async function tryUlistBatch(codes) {
   if (!codes.length) return {};
-  const secids = codes.map(secid).join(",");
-  const url = new URL("https://push2.eastmoney.com/api/qt/ulist.np/get");
-  url.searchParams.set("fltt", "2");
-  url.searchParams.set("secids", secids);
-  url.searchParams.set(
-    "fields",
-    "f12,f14,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f124"
-  );
-  url.searchParams.set("_", String(Date.now()));
 
-  const data = await fetchJson(url.toString());
-  const diff = data?.data?.diff;
   const out = {};
+  const batches = [];
+  for (let i = 0; i < codes.length; i += ULIST_BATCH_SIZE) {
+    batches.push(codes.slice(i, i + ULIST_BATCH_SIZE));
+  }
 
-  if (Array.isArray(diff)) {
-    for (const row of diff) {
-      if (!row || row.f12 == null) continue;
-      const r = makeUlistRow(row);
-      out[r.code] = r;
-    }
-  } else if (diff && typeof diff === "object") {
-    for (const k of Object.keys(diff)) {
-      const row = diff[k];
-      if (!row || row.f12 == null) continue;
-      const r = makeUlistRow(row);
-      out[r.code] = r;
+  for (let i = 0; i < batches.length; i++) {
+    if (i > 0) await sleep(ULIST_BATCH_DELAY_MS);
+    const batch = batches[i];
+    const secids = batch.map(secid).join(",");
+    const url = new URL("https://push2.eastmoney.com/api/qt/ulist.np/get");
+    url.searchParams.set("fltt", "2");
+    url.searchParams.set("secids", secids);
+    url.searchParams.set(
+      "fields",
+      "f12,f14,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f124"
+    );
+    url.searchParams.set("_", String(Date.now()));
+
+    const data = await fetchJson(url.toString());
+    const diff = data?.data?.diff;
+
+    if (Array.isArray(diff)) {
+      for (const row of diff) {
+        if (!row || row.f12 == null) continue;
+        const r = makeUlistRow(row);
+        out[r.code] = r;
+      }
+    } else if (diff && typeof diff === "object") {
+      for (const k of Object.keys(diff)) {
+        const row = diff[k];
+        if (!row || row.f12 == null) continue;
+        const r = makeUlistRow(row);
+        out[r.code] = r;
+      }
+    } else {
+      console.log("ulist batch empty", JSON.stringify(data).slice(0, 200));
     }
   }
 
-  if (!Object.keys(out).length) {
-    console.log("ulist batch empty", JSON.stringify(data).slice(0, 200));
-  }
   return out;
 }
 
@@ -283,8 +303,6 @@ async function writeCache(flow, ctx) {
 
 /** 带缓存：命中直接返回；未命中依次尝试三个源；成功才写缓存 */
 async function fetchEastmoneyFundFlow(code, ctx) {
-  const { request } = cacheKeyOf(code);
-
   const hit = await readCache(code);
   if (hit) return hit;
 
@@ -306,25 +324,45 @@ async function fetchEastmoneyFundFlow(code, ctx) {
   return flow;
 }
 
-/** 批量：先查缓存；未命中的做一次 ulist 批量；仍未拿到的逐只降级 minute/daily */
+/** 简单并发控制：最多 concurrency 个 worker 同时执行 */
+async function runWithConcurrency(items, concurrency, worker) {
+  const queue = items.slice();
+  const runners = Array.from(
+    { length: Math.min(concurrency, queue.length) },
+    async () => {
+      while (queue.length) {
+        const item = queue.shift();
+        await worker(item);
+      }
+    }
+  );
+  await Promise.all(runners);
+}
+
+/** 批量：查缓存 → 分批 ulist → 逐只降级（限并发 + 延迟） */
 async function fetchBatchFundFlow(codes, ctx) {
   const results = {};
   const missing = [];
 
-  // 1) 查缓存
-  for (const c of codes) {
-    const key = String(c).padStart(6, "0");
-    const hit = await readCache(key);
-    if (hit) {
-      results[key] = hit;
-    } else {
-      missing.push(key);
-    }
-  }
+  // 1) 并发查缓存（Cache API 很快，不增加上游压力）
+  await Promise.all(
+    codes.map(async (c) => {
+      const key = String(c).padStart(6, "0");
+      const hit = await readCache(key);
+      if (hit) {
+        results[key] = hit;
+      } else {
+        missing.push(key);
+      }
+    })
+  );
 
   if (!missing.length) return results;
 
-  // 2) 一次批量 ulist（N 只代码 = 1 次请求）
+  // 稳定 secids 顺序
+  missing.sort();
+
+  // 2) 分批 ulist
   let ulistMap = {};
   try {
     ulistMap = await tryUlistBatch(missing);
@@ -346,27 +384,26 @@ async function fetchBatchFundFlow(codes, ctx) {
 
   if (!stillMissing.length) return results;
 
-  // 4) 仍缺失的逐只降级到 minute/daily
-  await Promise.all(
-    stillMissing.map(async (key) => {
-      let flow = null;
-      for (const fn of [tryMinute, tryDaily]) {
-        try {
-          flow = await fn(key);
-          if (flow && flow.main_net != null) break;
-        } catch (e) {
-          console.log("source fail", fn.name, key, e.message);
-        }
-        flow = null;
+  // 4) 仍缺失的逐只降级（限制并发 + 延迟）
+  await runWithConcurrency(stillMissing, DEGRADE_CONCURRENCY, async (key) => {
+    let flow = null;
+    for (const fn of [tryMinute, tryDaily]) {
+      try {
+        flow = await fn(key);
+        if (flow && flow.main_net != null) break;
+      } catch (e) {
+        console.log("source fail", fn.name, key, e.message);
       }
-      if (flow && flow.main_net != null) {
-        results[key] = flow;
-        await writeCache(flow, ctx);
-      } else {
-        results[key] = null;
-      }
-    })
-  );
+      flow = null;
+    }
+    if (flow && flow.main_net != null) {
+      results[key] = flow;
+      await writeCache(flow, ctx);
+    } else {
+      results[key] = null;
+    }
+    if (DEGRADE_DELAY_MS > 0) await sleep(DEGRADE_DELAY_MS);
+  });
 
   return results;
 }
