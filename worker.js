@@ -21,7 +21,8 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-const CACHE_TTL_SECONDS = 60;
+// 缓存 TTL 与 300s 监控间隔匹配：每轮监控基本都命中上一轮缓存
+const CACHE_TTL_SECONDS = 280;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -89,7 +90,26 @@ function tsFromSec(sec) {
   return formatBeijing(Number(sec) * 1000);
 }
 
-/** 源 1：ulist.np 快照（最稳） */
+function makeUlistRow(row) {
+  const code = String(row.f12).padStart(6, "0");
+  return {
+    code,
+    main_net: num(row.f62),
+    main_net_pct: num(row.f184),
+    super_net: num(row.f66),
+    super_net_pct: num(row.f69),
+    large_net: num(row.f72),
+    large_net_pct: num(row.f75),
+    mid_net: num(row.f78),
+    mid_net_pct: num(row.f81),
+    small_net: num(row.f84),
+    small_net_pct: num(row.f87),
+    time: tsFromSec(row.f124),
+    source: "eastmoney_ulist",
+  };
+}
+
+/** 源 1：ulist.np 快照（单只，保留原逻辑） */
 async function tryUlist(code) {
   const sid = secid(code);
   const url = new URL("https://push2.eastmoney.com/api/qt/ulist.np/get");
@@ -108,21 +128,45 @@ async function tryUlist(code) {
     console.log("ulist empty", code, JSON.stringify(data).slice(0, 200));
     return null;
   }
-  return {
-    code: String(code).padStart(6, "0"),
-    main_net: num(row.f62),
-    main_net_pct: num(row.f184),
-    super_net: num(row.f66),
-    super_net_pct: num(row.f69),
-    large_net: num(row.f72),
-    large_net_pct: num(row.f75),
-    mid_net: num(row.f78),
-    mid_net_pct: num(row.f81),
-    small_net: num(row.f84),
-    small_net_pct: num(row.f87),
-    time: tsFromSec(row.f124),
-    source: "eastmoney_ulist",
-  };
+  return makeUlistRow(row);
+}
+
+/** 源 1-批量：一次请求取多只，返回 { code: flow } */
+async function tryUlistBatch(codes) {
+  if (!codes.length) return {};
+  const secids = codes.map(secid).join(",");
+  const url = new URL("https://push2.eastmoney.com/api/qt/ulist.np/get");
+  url.searchParams.set("fltt", "2");
+  url.searchParams.set("secids", secids);
+  url.searchParams.set(
+    "fields",
+    "f12,f14,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f124"
+  );
+  url.searchParams.set("_", String(Date.now()));
+
+  const data = await fetchJson(url.toString());
+  const diff = data?.data?.diff;
+  const out = {};
+
+  if (Array.isArray(diff)) {
+    for (const row of diff) {
+      if (!row || row.f12 == null) continue;
+      const r = makeUlistRow(row);
+      out[r.code] = r;
+    }
+  } else if (diff && typeof diff === "object") {
+    for (const k of Object.keys(diff)) {
+      const row = diff[k];
+      if (!row || row.f12 == null) continue;
+      const r = makeUlistRow(row);
+      out[r.code] = r;
+    }
+  }
+
+  if (!Object.keys(out).length) {
+    console.log("ulist batch empty", JSON.stringify(data).slice(0, 200));
+  }
+  return out;
 }
 
 function parseKline(p, code, source) {
@@ -199,47 +243,132 @@ async function tryDaily(code) {
   );
 }
 
+function cacheKeyOf(code) {
+  const key = String(code).padStart(6, "0");
+  return {
+    key,
+    request: new Request(`https://cache.internal/fundflow/${key}`, {
+      method: "GET",
+    }),
+  };
+}
+
+async function readCache(code) {
+  const { request } = cacheKeyOf(code);
+  const cache = caches.default;
+  const hit = await cache.match(request);
+  if (!hit) return null;
+  try {
+    const obj = await hit.json();
+    if (obj && obj.main_net != null && obj.source) {
+      return { ...obj, cached: true };
+    }
+  } catch {}
+  return null;
+}
+
+async function writeCache(flow, ctx) {
+  if (!flow || flow.main_net == null) return;
+  const { request } = cacheKeyOf(flow.code);
+  const cache = caches.default;
+  const resp = new Response(JSON.stringify(flow), {
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": `max-age=${CACHE_TTL_SECONDS}`,
+    },
+  });
+  if (ctx && ctx.waitUntil) ctx.waitUntil(cache.put(request, resp.clone()));
+  else await cache.put(request, resp.clone());
+}
+
 /** 带缓存：命中直接返回；未命中依次尝试三个源；成功才写缓存 */
 async function fetchEastmoneyFundFlow(code, ctx) {
-  const key = String(code).padStart(6, "0");
-  const cache = caches.default;
-  const cacheKey = new Request(`https://cache.internal/fundflow/${key}`, {
-    method: "GET",
-  });
+  const { request } = cacheKeyOf(code);
 
-  const hit = await cache.match(cacheKey);
-  if (hit) {
-    try {
-      const obj = await hit.json();
-      if (obj && obj.main_net != null && obj.source) {
-        return { ...obj, cached: true };
-      }
-    } catch {}
-  }
+  const hit = await readCache(code);
+  if (hit) return hit;
 
   let flow = null;
   for (const fn of [tryUlist, tryMinute, tryDaily]) {
     try {
-      flow = await fn(key);
+      flow = await fn(code);
       if (flow && flow.main_net != null) break;
     } catch (e) {
-      console.log("source fail", fn.name, key, e.message);
+      console.log("source fail", fn.name, code, e.message);
     }
     flow = null;
   }
 
   if (flow && flow.main_net != null) {
-    const resp = new Response(JSON.stringify(flow), {
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": `max-age=${CACHE_TTL_SECONDS}`,
-      },
-    });
-    if (ctx && ctx.waitUntil) ctx.waitUntil(cache.put(cacheKey, resp.clone()));
-    else await cache.put(cacheKey, resp.clone());
+    await writeCache(flow, ctx);
   }
 
   return flow;
+}
+
+/** 批量：先查缓存；未命中的做一次 ulist 批量；仍未拿到的逐只降级 minute/daily */
+async function fetchBatchFundFlow(codes, ctx) {
+  const results = {};
+  const missing = [];
+
+  // 1) 查缓存
+  for (const c of codes) {
+    const key = String(c).padStart(6, "0");
+    const hit = await readCache(key);
+    if (hit) {
+      results[key] = hit;
+    } else {
+      missing.push(key);
+    }
+  }
+
+  if (!missing.length) return results;
+
+  // 2) 一次批量 ulist（N 只代码 = 1 次请求）
+  let ulistMap = {};
+  try {
+    ulistMap = await tryUlistBatch(missing);
+  } catch (e) {
+    console.log("ulist batch fail", e.message);
+  }
+
+  // 3) 批量结果落库
+  const stillMissing = [];
+  for (const key of missing) {
+    const flow = ulistMap[key];
+    if (flow && flow.main_net != null) {
+      results[key] = flow;
+      await writeCache(flow, ctx);
+    } else {
+      stillMissing.push(key);
+    }
+  }
+
+  if (!stillMissing.length) return results;
+
+  // 4) 仍缺失的逐只降级到 minute/daily
+  await Promise.all(
+    stillMissing.map(async (key) => {
+      let flow = null;
+      for (const fn of [tryMinute, tryDaily]) {
+        try {
+          flow = await fn(key);
+          if (flow && flow.main_net != null) break;
+        } catch (e) {
+          console.log("source fail", fn.name, key, e.message);
+        }
+        flow = null;
+      }
+      if (flow && flow.main_net != null) {
+        results[key] = flow;
+        await writeCache(flow, ctx);
+      } else {
+        results[key] = null;
+      }
+    })
+  );
+
+  return results;
 }
 
 export default {
@@ -270,13 +399,7 @@ export default {
           .map((c) => c.trim())
           .filter(Boolean);
         if (!codes.length) return json({ error: "missing codes" }, 400);
-        const results = {};
-        await Promise.all(
-          codes.map(async (c) => {
-            const k = c.padStart(6, "0");
-            results[k] = await fetchEastmoneyFundFlow(k, ctx);
-          })
-        );
+        const results = await fetchBatchFundFlow(codes, ctx);
         return json({ time: new Date().toISOString(), results });
       }
 
@@ -291,12 +414,7 @@ export default {
           String(c).padStart(6, "0")
         );
         if (!codes.length) return json({ error: "missing codes" }, 400);
-        const results = {};
-        await Promise.all(
-          codes.map(async (c) => {
-            results[c] = await fetchEastmoneyFundFlow(c, ctx);
-          })
-        );
+        const results = await fetchBatchFundFlow(codes, ctx);
         return json({ time: new Date().toISOString(), results });
       }
 
