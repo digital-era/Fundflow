@@ -15,8 +15,8 @@ const CORS = {
 
 // 新鲜 TTL：≤400s（数据年龄不超过 ~6.5 分钟）
 const CACHE_FRESH_SECONDS = 400;
-// 过期回退 TTL：1 小时（刷新失败时返回上次成功的数据，而不是 null）
-const CACHE_STALE_SECONDS = 3600;
+// 过期回退 TTL：20分钟（刷新失败时返回上次成功的数据，而不是 null）
+const CACHE_STALE_SECONDS = 1200;
 
 // 批量 ulist：恢复到 15，减少请求总数
 const ULIST_BATCH_SIZE = 15;
