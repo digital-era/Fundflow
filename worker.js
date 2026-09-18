@@ -21,19 +21,19 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-//380~440s	大部分轮命中，少量刷新	数据新鲜度≤ 7 分钟
-// 基础 TTL：>380s 监控间隔，保证下一次扫描能命中
+// 380~440s：大部分轮命中，少量刷新，数据新鲜度 ≤ 7 分钟
 const CACHE_TTL_BASE = 380;
-// TTL 抖动上限（秒）：给每个代码加 0~200s 抖动，打散集中过期
 const CACHE_TTL_JITTER = 60;
 
-// ulist 分批：更小批次、更长间隔，降低被东财静默丢弃的概率
-const ULIST_BATCH_SIZE = 10;
+// 批量 ulist：批次更小，降低单批失败的影响面
+const ULIST_BATCH_SIZE = 5;
 const ULIST_BATCH_DELAY_MS = 400;
-// 全部失败时再做一次 ulist 重试前的等待
-const ULIST_RETRY_DELAY_MS = 600;
 
-// 降级逐只请求：限制并发 + 加延迟
+// 第二轮改为逐只 ulist 重试的并发与间隔
+const ULIST_RETRY_CONCURRENCY = 3;
+const ULIST_RETRY_DELAY_MS = 250;
+
+// 第三轮 minute/daily 降级
 const DEGRADE_CONCURRENCY = 3;
 const DEGRADE_DELAY_MS = 200;
 
@@ -124,7 +124,6 @@ function makeUlistRow(row) {
   };
 }
 
-/** 基于代码派生抖动，让每只代码的过期时间不完全一致 */
 function cacheTTLFor(code) {
   let h = 0;
   const s = String(code);
@@ -135,7 +134,7 @@ function cacheTTLFor(code) {
   return CACHE_TTL_BASE + jitter;
 }
 
-/** 源 1：ulist.np 快照（单只，保留原逻辑） */
+/** 源 1：ulist.np 单只 */
 async function tryUlist(code) {
   const sid = secid(code);
   const url = new URL("https://push2.eastmoney.com/api/qt/ulist.np/get");
@@ -182,12 +181,14 @@ async function tryUlistBatch(codes) {
 
     const data = await fetchJson(url.toString());
     const diff = data?.data?.diff;
+    let got = 0;
 
     if (Array.isArray(diff)) {
       for (const row of diff) {
         if (!row || row.f12 == null) continue;
         const r = makeUlistRow(row);
         out[r.code] = r;
+        got++;
       }
     } else if (diff && typeof diff === "object") {
       for (const k of Object.keys(diff)) {
@@ -195,10 +196,12 @@ async function tryUlistBatch(codes) {
         if (!row || row.f12 == null) continue;
         const r = makeUlistRow(row);
         out[r.code] = r;
+        got++;
       }
-    } else {
-      console.log("ulist batch empty", JSON.stringify(data).slice(0, 200));
     }
+    console.log(
+      `ulist batch ${i + 1}/${batches.length} req=${batch.length} got=${got}`
+    );
   }
 
   return out;
@@ -222,7 +225,6 @@ function parseKline(p, code, source) {
   };
 }
 
-/** 源 2：分钟级 kline */
 async function tryMinute(code) {
   const sid = secid(code);
   const url = new URL("https://push2.eastmoney.com/api/qt/stock/fflow/kline/get");
@@ -249,7 +251,6 @@ async function tryMinute(code) {
   );
 }
 
-/** 源 3：日级 kline（兜底） */
 async function tryDaily(code) {
   const sid = secid(code);
   const url = new URL(
@@ -317,7 +318,6 @@ async function writeCache(flow, ctx) {
   else await cache.put(request, resp.clone());
 }
 
-/** 带缓存：命中直接返回；未命中依次尝试三个源；成功才写缓存 */
 async function fetchEastmoneyFundFlow(code, ctx) {
   const hit = await readCache(code);
   if (hit) return hit;
@@ -340,7 +340,6 @@ async function fetchEastmoneyFundFlow(code, ctx) {
   return flow;
 }
 
-/** 并发控制：最多 concurrency 个同时执行 */
 async function runWithConcurrency(items, concurrency, worker) {
   const queue = items.slice();
   const runners = Array.from(
@@ -355,7 +354,10 @@ async function runWithConcurrency(items, concurrency, worker) {
   await Promise.all(runners);
 }
 
-/** 批量：查缓存 → 分批 ulist → 失败再 ulist 重试 → 逐只降级（限并发 + 延迟） */
+/**
+ * 批量：查缓存 → 分批 ulist → 逐只 ulist 重试 → 逐只 minute/daily 兜底
+ * 关键修复：第二轮从“整批重试”改为“逐只重试”，避免一次批量失败带走整批 10 只。
+ */
 async function fetchBatchFundFlow(codes, ctx) {
   const results = {};
   const missing = [];
@@ -398,48 +400,54 @@ async function fetchBatchFundFlow(codes, ctx) {
 
   if (!stillMissing1.length) return results;
 
-  // 3) 第二轮 ulist 重试（对第一轮失败的代码再拉一次）
-  await sleep(ULIST_RETRY_DELAY_MS);
-  let retryMap = {};
-  try {
-    retryMap = await tryUlistBatch(stillMissing1);
-  } catch (e) {
-    console.log("ulist retry fail", e.message);
-  }
-
+  // 3) 第二轮：逐只 ulist 重试（关键修复）
   const stillMissing2 = [];
-  for (const key of stillMissing1) {
-    const flow = retryMap[key];
-    if (flow && flow.main_net != null) {
-      results[key] = flow;
-      await writeCache(flow, ctx);
-    } else {
-      stillMissing2.push(key);
+  await runWithConcurrency(
+    stillMissing1,
+    ULIST_RETRY_CONCURRENCY,
+    async (key) => {
+      let flow = null;
+      try {
+        flow = await tryUlist(key);
+      } catch (e) {
+        console.log("ulist single retry fail", key, e.message);
+      }
+      if (flow && flow.main_net != null) {
+        results[key] = flow;
+        await writeCache(flow, ctx);
+      } else {
+        stillMissing2.push(key);
+      }
+      if (ULIST_RETRY_DELAY_MS > 0) await sleep(ULIST_RETRY_DELAY_MS);
     }
-  }
+  );
 
   if (!stillMissing2.length) return results;
 
-  // 4) 仍缺失的逐只降级到 minute/daily
-  await runWithConcurrency(stillMissing2, DEGRADE_CONCURRENCY, async (key) => {
-    let flow = null;
-    for (const fn of [tryMinute, tryDaily]) {
-      try {
-        flow = await fn(key);
-        if (flow && flow.main_net != null) break;
-      } catch (e) {
-        console.log("source fail", fn.name, key, e.message);
+  // 4) 第三轮：逐只 minute/daily 兜底
+  await runWithConcurrency(
+    stillMissing2,
+    DEGRADE_CONCURRENCY,
+    async (key) => {
+      let flow = null;
+      for (const fn of [tryMinute, tryDaily]) {
+        try {
+          flow = await fn(key);
+          if (flow && flow.main_net != null) break;
+        } catch (e) {
+          console.log("source fail", fn.name, key, e.message);
+        }
+        flow = null;
       }
-      flow = null;
+      if (flow && flow.main_net != null) {
+        results[key] = flow;
+        await writeCache(flow, ctx);
+      } else {
+        results[key] = null;
+      }
+      if (DEGRADE_DELAY_MS > 0) await sleep(DEGRADE_DELAY_MS);
     }
-    if (flow && flow.main_net != null) {
-      results[key] = flow;
-      await writeCache(flow, ctx);
-    } else {
-      results[key] = null;
-    }
-    if (DEGRADE_DELAY_MS > 0) await sleep(DEGRADE_DELAY_MS);
-  });
+  );
 
   return results;
 }
