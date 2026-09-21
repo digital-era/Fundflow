@@ -301,6 +301,19 @@ function sourceRank(src) {
   return 0;
 }
 
+/** newFlow 是否优于 oldFlow：日期 → 源优先级 → 时间 */
+function isBetterFlow(newFlow, oldFlow) {
+  if (!oldFlow) return true;
+  if (!newFlow) return false;
+  const newDay = String(newFlow.time || "").slice(0, 10);
+  const oldDay = String(oldFlow.time || "").slice(0, 10);
+  if (newDay !== oldDay) return newDay > oldDay;
+  const newRank = sourceRank(newFlow.source);
+  const oldRank = sourceRank(oldFlow.source);
+  if (newRank !== oldRank) return newRank > oldRank;
+  return String(newFlow.time || "") > String(oldFlow.time || "");
+}
+
 /**
  * 读缓存，返回 { fresh, stale }：
  *   fresh：cached_at 距今 ≤ CACHE_FRESH_SECONDS，可直接用
@@ -406,6 +419,13 @@ async function fetchEastmoneyFundFlow(code, ctx) {
   }
 
   if (flow && flow.main_net != null) {
+    // ⭐ stale 更优时优先返回 stale（如 stale 是今日 ulist，flow 是昨日 daily）
+    if (stale && !isBetterFlow(flow, stale)) {
+      console.log(
+        `[fetch] prefer stale: ${code} ${stale.source}@${stale.time} > ${flow.source}@${flow.time}`
+      );
+      return { ...stale, cached: true, stale: true };
+    }
     await writeCache(flow, ctx);
     return flow;
   }
@@ -489,12 +509,21 @@ async function fetchBatchFundFlow(codes, ctx) {
       }
       flow = null;
     }
+    const fallback = fallbacks[key];
     if (flow && flow.main_net != null) {
-      results[key] = flow;
-      await writeCache(flow, ctx);
-    } else if (fallbacks[key]) {
+      // ⭐ stale 更优时优先用 stale
+      if (fallback && !isBetterFlow(flow, fallback)) {
+        console.log(
+          `[batch] prefer stale: ${key} ${fallback.source}@${fallback.time} > ${flow.source}@${flow.time}`
+        );
+        results[key] = { ...fallback, cached: true, stale: true };
+      } else {
+        results[key] = flow;
+        await writeCache(flow, ctx);
+      }
+    } else if (fallback) {
       // 4) 回退到过期缓存（不显示 null）
-      results[key] = { ...fallbacks[key], cached: true, stale: true };
+      results[key] = { ...fallback, cached: true, stale: true };
     } else {
       results[key] = null;
     }
