@@ -293,6 +293,14 @@ function cacheKeyOf(code) {
   };
 }
 
+/** 数据源优先级：ulist > minute > daily */
+function sourceRank(src) {
+  if (src === "eastmoney_ulist") return 3;
+  if (src === "eastmoney_minute") return 2;
+  if (src === "eastmoney_daily") return 1;
+  return 0;
+}
+
 /**
  * 读缓存，返回 { fresh, stale }：
  *   fresh：cached_at 距今 ≤ CACHE_FRESH_SECONDS，可直接用
@@ -320,6 +328,55 @@ async function writeCache(flow, ctx) {
   if (!flow || flow.main_net == null) return;
   const { request } = cacheKeyOf(flow.code);
   const cache = caches.default;
+
+  // ⭐ 防信息倒退：按「日期 → 源优先级 → 时间」三级比较
+  try {
+    const existing = await cache.match(request);
+    if (existing) {
+      const old = await existing.json();
+      if (old && old.time && flow.time) {
+        const oldDay = String(old.time).slice(0, 10);
+        const newDay = String(flow.time).slice(0, 10);
+
+        // 1. 新数据日期更旧 → 拒绝
+        if (newDay < oldDay) {
+          console.log(
+            `[writeCache] skip older day: ${flow.code} ${flow.time} < ${old.time} (${old.source}→${flow.source})`
+          );
+          return;
+        }
+
+        // 2. 同一天 → 先比源优先级，再比时间
+        if (newDay === oldDay) {
+          const oldRank = sourceRank(old.source);
+          const newRank = sourceRank(flow.source);
+
+          // 2a. 新源优先级更低 → 拒绝（如 ulist 不被 minute/daily 覆盖）
+          if (newRank < oldRank) {
+            console.log(
+              `[writeCache] skip lower source: ${flow.code} ${flow.source}(${newRank}) < ${old.source}(${oldRank}) @ ${flow.time}`
+            );
+            return;
+          }
+
+          // 2b. 同源且时间更旧 → 拒绝
+          if (newRank === oldRank && flow.time < old.time) {
+            console.log(
+              `[writeCache] skip older same-source: ${flow.code} ${flow.time} < ${old.time} (${old.source})`
+            );
+            return;
+          }
+
+          // 2c. 其余情况（新源优先级更高，或同源时间更新/相等）→ 允许覆盖
+        }
+
+        // 3. 新数据日期更新 → 允许覆盖
+      }
+    }
+  } catch (e) {
+    console.log("[writeCache] read existing fail", e.message);
+  }
+
   const body = JSON.stringify({ ...flow, cached_at: Date.now() });
   const resp = new Response(body, {
     headers: {
